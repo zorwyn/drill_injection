@@ -33,6 +33,8 @@ INJECTED=false
 SEED_CREATED=false
 BASELINE_COST=""
 BASELINE_DEAD=""
+BASELINE_SIMPLE_MS=""                          # 简单查询基线耗时
+BASELINE_AGG_MS=""                             # 聚合查询基线耗时
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
@@ -225,6 +227,20 @@ phase_baseline() {
                          GROUP BY user_id ORDER BY count(*) DESC LIMIT 10;" \
                     | head -1)
     info "基线 EXPLAIN: ${BASELINE_COST}"
+
+    # 简单查询基线耗时 (主键点查)
+    BASELINE_SIMPLE_MS=$(sql "EXPLAIN ANALYZE SELECT * FROM ${SCHEMA}.${TABLE} WHERE id = 1;" \
+                         | grep 'Execution Time' | grep -oE '[0-9]+\.[0-9]+')
+    info "基线简单查询 (点查 id=1): ${BASELINE_SIMPLE_MS} ms"
+
+    # 聚合查询基线耗时
+    BASELINE_AGG_MS=$(sql "EXPLAIN ANALYZE
+                           SELECT region, count(*), avg(amount)
+                           FROM ${SCHEMA}.${TABLE}
+                           WHERE status = 'pending'
+                           GROUP BY region;" \
+                     | grep 'Execution Time' | grep -oE '[0-9]+\.[0-9]+')
+    info "基线聚合查询 (GROUP BY): ${BASELINE_AGG_MS} ms"
 
     # 完整 EXPLAIN ANALYZE 留底
     info "基线详细计划:"
@@ -454,6 +470,23 @@ phase_observe() {
                           GROUP BY user_id ORDER BY count(*) DESC LIMIT 10;" \
                      | head -1)
       info "EXPLAIN: ${current_plan}"
+
+      # ── 实际执行耗时对比 (vs 基线) ──
+      local simple_ms agg_ms
+      simple_ms=$(sql "EXPLAIN ANALYZE SELECT * FROM ${SCHEMA}.${TABLE} WHERE id = 1;" \
+                  | grep 'Execution Time' | grep -oE '[0-9]+\.[0-9]+')
+      agg_ms=$(sql "EXPLAIN ANALYZE
+                    SELECT region, count(*), avg(amount)
+                    FROM ${SCHEMA}.${TABLE}
+                    WHERE status = 'pending'
+                    GROUP BY region;" \
+               | grep 'Execution Time' | grep -oE '[0-9]+\.[0-9]+')
+
+      info "┌─────────────────────────────────────────┐"
+      info "│ 查询耗时对比          基线    → 当前     │"
+      info "│ 点查 (id=1):      ${BASELINE_SIMPLE_MS:-?} ms → ${simple_ms:-?} ms"
+      info "│ 聚合 (GROUP BY):  ${BASELINE_AGG_MS:-?} ms → ${agg_ms:-?} ms"
+      info "└─────────────────────────────────────────┘"
 
       # 长事务存活检测
       local tx_alive
