@@ -19,9 +19,9 @@ GSQL="${GSQL:-gsql -d postgres -p 5432}"       # 数据库连接命令
 DRY_RUN="${DRY_RUN:-true}"                     # true=只打印不执行
 SCHEMA="${SCHEMA:-fault_drill}"                # 演练用 schema (隔离)
 TABLE="${TABLE:-drill_orders}"                 # 目标表名
-SEED_ROWS="${SEED_ROWS:-500000}"               # 种子数据行数
-UPDATE_ROWS="${UPDATE_ROWS:-200000}"           # 每轮更新行数
-UPDATE_ROUNDS="${UPDATE_ROUNDS:-5}"            # UPDATE 轮次
+SEED_ROWS="${SEED_ROWS:-2000000}"              # 种子数据行数 (200万)
+UPDATE_ROWS="${UPDATE_ROWS:-2000000}"          # 每轮更新行数 (全表)
+UPDATE_ROUNDS="${UPDATE_ROUNDS:-8}"            # UPDATE 轮次
 OBSERVE_INTERVAL="${OBSERVE_INTERVAL:-30}"     # 观测采集间隔 (秒)
 ABORT_CONN_PCT="${ABORT_CONN_PCT:-80}"         # 连接数超此比例则中止
 ABORT_LAG_SEC="${ABORT_LAG_SEC:-60}"           # 复制延迟超此秒数则中止
@@ -223,7 +223,7 @@ phase_seed() {
          region     VARCHAR(10)    NOT NULL,
          created_at TIMESTAMP      NOT NULL DEFAULT now(),
          updated_at TIMESTAMP      NOT NULL DEFAULT now(),
-         padding    VARCHAR(200)   NOT NULL DEFAULT repeat('x', 200)
+         padding    VARCHAR(500)   NOT NULL DEFAULT repeat('x', 500)
        ) WITH (STORAGE_TYPE=ASTORE);"
 
   sql "CREATE INDEX idx_drill_status ON ${SCHEMA}.${TABLE}(status);"
@@ -352,34 +352,31 @@ EOF
 phase_dead_tuples() {
   info "===== Phase 4: 制造死元组 (${UPDATE_ROUNDS} 轮 x ${UPDATE_ROWS} 行) ====="
 
-  # 每轮更新不同字段, 模拟真实业务多样性
+  # 每轮全表 UPDATE 不同字段, 让死元组均匀散布在所有 page 上
+  # 不要 WHERE id <= N — 那样只有前几个 page 膨胀, 效果不明显
   local round_sqls=(
     "UPDATE ${SCHEMA}.${TABLE}
      SET status = CASE WHEN status='pending' THEN 'paid' ELSE 'pending' END,
-         updated_at = now()
-     WHERE id <= ${UPDATE_ROWS};"
+         updated_at = now();"
 
     "UPDATE ${SCHEMA}.${TABLE}
      SET amount = amount + 0.01,
-         updated_at = now()
-     WHERE id <= ${UPDATE_ROWS};"
+         updated_at = now();"
 
     "UPDATE ${SCHEMA}.${TABLE}
      SET region = CASE WHEN region LIKE 'drill_%' THEN substr(region,7)
                        ELSE 'drill_' || region END,
-         updated_at = now()
-     WHERE id <= ${UPDATE_ROWS};"
+         updated_at = now();"
 
     "UPDATE ${SCHEMA}.${TABLE}
-     SET status = 'review',
-         updated_at = now()
-     WHERE id IN (SELECT id FROM ${SCHEMA}.${TABLE} ORDER BY id LIMIT ${UPDATE_ROWS});"
+     SET status = CASE WHEN status='review' THEN 'done'
+                       WHEN status='done' THEN 'pending'
+                       ELSE 'review' END,
+         updated_at = now();"
 
     "UPDATE ${SCHEMA}.${TABLE}
      SET amount = amount - 0.01,
-         status = CASE WHEN status='review' THEN 'done' ELSE status END,
-         updated_at = now()
-     WHERE id <= ${UPDATE_ROWS};"
+         updated_at = now();"
   )
 
   for round in $(seq 1 "${UPDATE_ROUNDS}"); do
