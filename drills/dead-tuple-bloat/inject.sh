@@ -6,7 +6,8 @@
 #          → 表膨胀 → 优化器代价估算偏差 → 查询计划变差 → SQL 整体变慢
 #
 # 使用方式:
-#   DRY_RUN=false GSQL="gsql -d mydb -p 5432" bash inject.sh
+#   bash inject.sh                                          # demo 模式, 模拟输出看效果
+#   DRY_RUN=false GSQL="gsql -d mydb -p 5432" bash inject.sh  # 实际注入
 #
 # 退出即清理 — Ctrl+C / kill / SSH 断开 都会自动回滚
 # 单文件，scp 到服务器直接跑，无外部依赖
@@ -279,36 +280,30 @@ phase_long_tx() {
     return 0
   fi
 
-  # 后台开事务, application_name 标记方便清理
+  # 后台开事务: 用 echo + 管道送 SQL, 一个连接内顺序执行
+  # 注意: 不用 heredoc 避免注释和特殊字符解析问题
   (
-    ${GSQL} <<EOSQL
-SET application_name = 'fault_drill_long_tx';
-BEGIN;
--- 执行查询固定快照 (snapshot pinning)
-SELECT count(*) FROM ${SCHEMA}.${TABLE} WHERE status = 'pending';
--- 记录事务信息
-SELECT pg_backend_pid() AS holder_pid,
-       txid_current()   AS holder_xid,
-       now()            AS started_at;
--- 无限等待, 直到被外部 kill
-SELECT pg_sleep(86400);
-EOSQL
+    printf "%s\n" \
+      "SET application_name = 'fault_drill_long_tx';" \
+      "BEGIN;" \
+      "SELECT count(*) FROM ${SCHEMA}.${TABLE} WHERE status = 'pending';" \
+      "SELECT pg_sleep(86400);" \
+    | ${GSQL}
   ) &
   LONG_TX_PID=$!
   sleep 3
 
+  # pg_sleep 是阻塞调用, 事务状态是 active 不是 idle in transaction
   LONG_TX_BACKEND=$(sql "SELECT pid FROM pg_stat_activity
                          WHERE application_name = 'fault_drill_long_tx'
-                           AND state = 'idle in transaction'
-                         ORDER BY xact_start LIMIT 1;")
+                         ORDER BY xact_start LIMIT 1")
 
   if [[ -z "${LONG_TX_BACKEND}" ]]; then
     warn "未找到长事务 backend, 可能启动延迟, 重试..."
     sleep 3
     LONG_TX_BACKEND=$(sql "SELECT pid FROM pg_stat_activity
                            WHERE application_name = 'fault_drill_long_tx'
-                             AND state = 'idle in transaction'
-                           ORDER BY xact_start LIMIT 1;")
+                           ORDER BY xact_start LIMIT 1")
   fi
 
   info "长事务已启动 (shell_pid=${LONG_TX_PID}, backend_pid=${LONG_TX_BACKEND})"
@@ -381,7 +376,10 @@ phase_verify() {
   info "===== Phase 5: 验证故障效果 ====="
 
   if [[ "${DRY_RUN}" == "true" ]]; then
-    info "DRY-RUN: 跳过验证"
+    info "[demo] 死元组: 1000000 | 活元组: 500000 | 死元组比: 66.7%"
+    info "[demo] 表大小: 380 MB (基线 210 MB)"
+    info "[demo] EXPLAIN cost: 基线 12840 → 当前 38520 (3.0x)"
+    info "[demo] autovacuum: 被长事务阻塞, 无法运行"
     return 0
   fi
 
@@ -504,12 +502,52 @@ workload_worker() {
   done
 }
 
+# ── Demo 模式 workload worker (不连库, 随机数模拟退化) ────────────────────────
+demo_workload_worker() {
+  local worker_id=$1
+  local interval=$2
+
+  local query_names=("点查" "条件聚合" "TOP-N" "用户订单" "多维汇总")
+  # 每种查询的基线耗时 (ms)
+  local base_times=(3 45 62 8 89)
+  local tick=0
+
+  while true; do
+    tick=$((tick + 1))
+    local idx=$(( RANDOM % ${#query_names[@]} ))
+    local qname="${query_names[$idx]}"
+    local base=${base_times[$idx]}
+
+    # 模拟逐渐变慢: 每轮 tick 增加一个倍率, 加一些随机抖动
+    local multiplier=$(( 1 + tick / 5 ))
+    local jitter=$(( RANDOM % (base / 2 + 1) ))
+    local elapsed_ms=$(( base * multiplier + jitter ))
+
+    local tag=""
+    if [[ ${elapsed_ms} -ge 1000 ]]; then
+      tag=" !! SLOW !!"
+    elif [[ ${elapsed_ms} -ge 200 ]]; then
+      tag=" * slow"
+    fi
+
+    printf '[%s] WORKLOAD[%d] %-10s %6d ms%s\n' \
+      "$(date '+%F %T')" "${worker_id}" "${qname}" "${elapsed_ms}" "${tag}"
+
+    sleep "${interval}"
+  done
+}
+
 # ── Phase 6: 启动模拟业务流量 ────────────────────────────────────────────────
 phase_workload() {
   info "===== Phase 6: 启动模拟业务流量 ====="
 
   if [[ "${DRY_RUN}" == "true" ]]; then
-    info "DRY-RUN: 跳过业务流量模拟"
+    info "DRY_RUN=true → 启动 demo 模式 (模拟数据, 不连库)"
+    for i in $(seq 1 "${WORKLOAD_CONCURRENCY}"); do
+      demo_workload_worker "${i}" "${WORKLOAD_INTERVAL}" &
+      WORKLOAD_PIDS+=($!)
+    done
+    info "Demo 业务流量已启动 (${WORKLOAD_CONCURRENCY} 并发)"
     return 0
   fi
 
@@ -554,8 +592,7 @@ phase_observe() {
         dead_tup=$(sql "SELECT n_dead_tup FROM pg_stat_user_tables
                         WHERE schemaname='${SCHEMA}' AND relname='${TABLE}';")
         tx_alive=$(sql "SELECT count(*) FROM pg_stat_activity
-                        WHERE application_name = 'fault_drill_long_tx'
-                          AND state = 'idle in transaction';")
+                        WHERE application_name = 'fault_drill_long_tx'")
 
         info "死元组: ${dead_tup} | 长事务存活: ${tx_alive}"
 
@@ -575,7 +612,13 @@ phase_observe() {
       # 中止条件
       check_abort || { warn "触发中止条件, 退出"; return 1; }
     else
-      info "DRY-RUN: 观测 #${tick}"
+      # DRY-RUN demo: 模拟后台指标
+      if (( tick % 4 == 0 )); then
+        local sim_dead=$(( 200000 * tick / 4 ))
+        echo ""
+        info "── [demo] 后台指标 #${tick} ──"
+        info "死元组: ${sim_dead} | 长事务存活: 1"
+      fi
     fi
 
     sleep "${OBSERVE_INTERVAL}"
