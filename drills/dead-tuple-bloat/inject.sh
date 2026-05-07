@@ -25,6 +25,8 @@ OBSERVE_INTERVAL="${OBSERVE_INTERVAL:-30}"     # 观测采集间隔 (秒)
 ABORT_CONN_PCT="${ABORT_CONN_PCT:-80}"         # 连接数超此比例则中止
 ABORT_LAG_SEC="${ABORT_LAG_SEC:-60}"           # 复制延迟超此秒数则中止
 DROP_ON_EXIT="${DROP_ON_EXIT:-false}"          # true=退出时删除演练 schema
+WORKLOAD_INTERVAL="${WORKLOAD_INTERVAL:-3}"    # 模拟业务流量间隔 (秒)
+WORKLOAD_CONCURRENCY="${WORKLOAD_CONCURRENCY:-4}"  # 模拟业务并发数
 
 # ── 内部状态 ──────────────────────────────────────────────────────────────────
 LONG_TX_PID=""
@@ -35,6 +37,7 @@ BASELINE_COST=""
 BASELINE_DEAD=""
 BASELINE_SIMPLE_MS=""                          # 简单查询基线耗时
 BASELINE_AGG_MS=""                             # 聚合查询基线耗时
+WORKLOAD_PIDS=()                               # 后台业务流量进程 PID
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
@@ -66,6 +69,17 @@ cleanup() {
   info "║          自动清理开始                 ║"
   info "║  exit_code=${exit_code}                          ║"
   info "╚═══════════════════════════════════════╝"
+
+  # 0) 杀后台业务流量进程
+  if [[ ${#WORKLOAD_PIDS[@]} -gt 0 ]]; then
+    info "[清理 0/5] 停止模拟业务流量 (${#WORKLOAD_PIDS[@]} 个进程)"
+    for wpid in "${WORKLOAD_PIDS[@]}"; do
+      kill "${wpid}" 2>/dev/null || true
+    done
+    for wpid in "${WORKLOAD_PIDS[@]}"; do
+      wait "${wpid}" 2>/dev/null || true
+    done
+  fi
 
   # 1) 杀后台长事务 shell 进程
   if [[ -n "${LONG_TX_PID}" ]]; then
@@ -431,96 +445,135 @@ phase_verify() {
   info "故障验证完成 ✓"
 }
 
-# ── Phase 6: 观测等待 (SRE 定位时间) ─────────────────────────────────────────
+# ── 模拟业务流量 (单个 worker) ────────────────────────────────────────────────
+# 后台持续跑业务 SQL, 打印耗时, 模拟真实应用流量
+# SRE 看到这些查询越来越慢 → 触发排查
+workload_worker() {
+  local worker_id=$1
+  local schema=$2
+  local table=$3
+  local interval=$4
+  local gsql_cmd=$5
+
+  # 模拟 5 种典型业务查询
+  local queries=(
+    "SELECT * FROM ${schema}.${table} WHERE id = (random()*500000)::int + 1;"
+    "SELECT count(*), avg(amount) FROM ${schema}.${table} WHERE status='pending' AND region='east';"
+    "SELECT user_id, sum(amount) FROM ${schema}.${table} WHERE status IN ('pending','paid') GROUP BY user_id ORDER BY sum(amount) DESC LIMIT 20;"
+    "SELECT * FROM ${schema}.${table} WHERE user_id = (random()*10000)::int AND status = 'paid' ORDER BY created_at DESC LIMIT 10;"
+    "SELECT region, status, count(*), avg(amount) FROM ${schema}.${table} GROUP BY region, status ORDER BY count(*) DESC;"
+  )
+  local query_names=(
+    "点查"
+    "条件聚合"
+    "TOP-N"
+    "用户订单"
+    "多维汇总"
+  )
+
+  while true; do
+    local idx=$(( RANDOM % ${#queries[@]} ))
+    local qname="${query_names[$idx]}"
+
+    # 用 \timing 拿真实耗时
+    local start_ns=$(date +%s%N 2>/dev/null || date +%s)
+    ${gsql_cmd} -t -A -c "${queries[$idx]}" >/dev/null 2>&1
+    local end_ns=$(date +%s%N 2>/dev/null || date +%s)
+
+    local elapsed_ms
+    if [[ ${#start_ns} -gt 10 ]]; then
+      # 有纳秒精度
+      elapsed_ms=$(( (end_ns - start_ns) / 1000000 ))
+    else
+      # 只有秒精度, 降级
+      elapsed_ms=$(( (end_ns - start_ns) * 1000 ))
+    fi
+
+    # 超过 200ms 标红, 超过 1000ms 标告警
+    local tag=""
+    if [[ ${elapsed_ms} -ge 1000 ]]; then
+      tag=" !! SLOW !!"
+    elif [[ ${elapsed_ms} -ge 200 ]]; then
+      tag=" * slow"
+    fi
+
+    printf '[%s] WORKLOAD[%d] %-10s %6d ms%s\n' \
+      "$(date '+%F %T')" "${worker_id}" "${qname}" "${elapsed_ms}" "${tag}"
+
+    sleep "${interval}"
+  done
+}
+
+# ── Phase 6: 启动模拟业务流量 ────────────────────────────────────────────────
+phase_workload() {
+  info "===== Phase 6: 启动模拟业务流量 ====="
+
+  if [[ "${DRY_RUN}" == "true" ]]; then
+    info "DRY-RUN: 跳过业务流量模拟"
+    return 0
+  fi
+
+  for i in $(seq 1 "${WORKLOAD_CONCURRENCY}"); do
+    workload_worker "${i}" "${SCHEMA}" "${TABLE}" "${WORKLOAD_INTERVAL}" "${GSQL}" &
+    WORKLOAD_PIDS+=($!)
+    info "业务流量 worker ${i} 已启动 (pid=${WORKLOAD_PIDS[-1]})"
+  done
+
+  info "模拟业务流量启动完成 (${WORKLOAD_CONCURRENCY} 并发, 间隔 ${WORKLOAD_INTERVAL}s) ✓"
+}
+
+# ── Phase 7: 观测等待 (SRE 定位时间) ─────────────────────────────────────────
 phase_observe() {
-  info "╔═══════════════════════════════════════╗"
-  info "║    故障已注入 — 进入观测等待模式      ║"
-  info "║    等待 SRE 定位根因并恢复            ║"
-  info "║    Ctrl+C 退出 → 自动清理             ║"
-  info "║    采集间隔: ${OBSERVE_INTERVAL}s                     ║"
-  info "╚═══════════════════════════════════════╝"
+  info "╔═══════════════════════════════════════════════════╗"
+  info "║  故障已注入, 业务流量运行中                       ║"
+  info "║                                                   ║"
+  info "║  SRE 应该能观察到:                                ║"
+  info "║    1. WORKLOAD 日志中查询耗时逐渐升高             ║"
+  info "║    2. 部分查询出现 * slow 或 !! SLOW !! 标记      ║"
+  info "║                                                   ║"
+  info "║  SRE 需要:                                        ║"
+  info "║    - 自己开一个 gsql 去排查                       ║"
+  info "║    - 找到根因 (长事务 → 死元组)                   ║"
+  info "║    - 手动恢复 (kill 长事务 + VACUUM)              ║"
+  info "║                                                   ║"
+  info "║  演练出题人: Ctrl+C 退出 → 自动清理               ║"
+  info "╚═══════════════════════════════════════════════════╝"
 
   local tick=0
   while true; do
     tick=$((tick + 1))
 
     if [[ "${DRY_RUN}" != "true" ]]; then
-      echo ""
-      info "── 观测 #${tick} ──────────────────────────"
+      # 每隔 OBSERVE_INTERVAL 做一轮后台指标采集 (不干扰 workload 输出)
+      # 只在关键节点打日志, 不刷屏
+      if (( tick % 4 == 0 )); then
+        echo ""
+        info "── 后台指标 #${tick} ──"
+        local dead_tup tx_alive
+
+        dead_tup=$(sql "SELECT n_dead_tup FROM pg_stat_user_tables
+                        WHERE schemaname='${SCHEMA}' AND relname='${TABLE}';")
+        tx_alive=$(sql "SELECT count(*) FROM pg_stat_activity
+                        WHERE application_name = 'fault_drill_long_tx'
+                          AND state = 'idle in transaction';")
+
+        info "死元组: ${dead_tup} | 长事务存活: ${tx_alive}"
+
+        # 检测 SRE 是否已恢复
+        if [[ "${dead_tup}" -lt 1000 ]] && [[ "${tx_alive}" == "0" ]]; then
+          echo ""
+          info "╔═══════════════════════════════════════╗"
+          info "║  SRE 演练完成!                        ║"
+          info "║  长事务已终止, 死元组已回收            ║"
+          info "╚═══════════════════════════════════════╝"
+          info "等待 30s 确认业务流量恢复正常..."
+          sleep 30
+          return 0
+        fi
+      fi
 
       # 中止条件
-      check_abort || { warn "触发中止条件, 退出观测"; return 1; }
-
-      # 死元组
-      local dead_tup
-      dead_tup=$(sql "SELECT n_dead_tup FROM pg_stat_user_tables
-                      WHERE schemaname='${SCHEMA}' AND relname='${TABLE}';")
-      info "死元组: ${dead_tup}"
-
-      # 表大小
-      local tbl_size
-      tbl_size=$(sql "SELECT pg_size_pretty(pg_total_relation_size(
-                      '${SCHEMA}.${TABLE}'));")
-      info "表大小: ${tbl_size}"
-
-      # EXPLAIN cost
-      local current_plan
-      current_plan=$(sql "EXPLAIN SELECT count(*) FROM ${SCHEMA}.${TABLE}
-                          WHERE status='pending' AND region='east'
-                          GROUP BY user_id ORDER BY count(*) DESC LIMIT 10;" \
-                     | head -1)
-      info "EXPLAIN: ${current_plan}"
-
-      # ── 实际执行耗时对比 (vs 基线) ──
-      local simple_ms agg_ms
-      simple_ms=$(sql "EXPLAIN ANALYZE SELECT * FROM ${SCHEMA}.${TABLE} WHERE id = 1;" \
-                  | grep 'Execution Time' | grep -oE '[0-9]+\.[0-9]+')
-      agg_ms=$(sql "EXPLAIN ANALYZE
-                    SELECT region, count(*), avg(amount)
-                    FROM ${SCHEMA}.${TABLE}
-                    WHERE status = 'pending'
-                    GROUP BY region;" \
-               | grep 'Execution Time' | grep -oE '[0-9]+\.[0-9]+')
-
-      info "┌─────────────────────────────────────────┐"
-      info "│ 查询耗时对比          基线    → 当前     │"
-      info "│ 点查 (id=1):      ${BASELINE_SIMPLE_MS:-?} ms → ${simple_ms:-?} ms"
-      info "│ 聚合 (GROUP BY):  ${BASELINE_AGG_MS:-?} ms → ${agg_ms:-?} ms"
-      info "└─────────────────────────────────────────┘"
-
-      # 长事务存活检测
-      local tx_alive
-      tx_alive=$(sql "SELECT count(*) FROM pg_stat_activity
-                      WHERE application_name = 'fault_drill_long_tx'
-                        AND state = 'idle in transaction';")
-      if [[ "${tx_alive}" == "0" ]]; then
-        info ">>> 长事务已被终止 (SRE 已介入?) <<<"
-      else
-        local tx_dur
-        tx_dur=$(sql "SELECT now()-xact_start FROM pg_stat_activity
-                      WHERE application_name = 'fault_drill_long_tx'
-                      LIMIT 1;")
-        info "长事务持续: ${tx_dur}"
-      fi
-
-      # autovacuum
-      local av_running
-      av_running=$(sql "SELECT count(*) FROM pg_stat_activity
-                        WHERE query ILIKE '%autovacuum%${TABLE}%';" 2>/dev/null)
-      if [[ "${av_running}" -gt 0 ]]; then
-        info "autovacuum: 运行中 (长事务可能已被清理)"
-      else
-        info "autovacuum: 未运行"
-      fi
-
-      # 死元组归零检测 = SRE 恢复成功
-      if [[ "${dead_tup}" -lt 1000 ]] && [[ "${tx_alive}" == "0" ]]; then
-        info "========================================="
-        info ">>> 检测到恢复完成: 死元组 < 1000 且长事务已终止 <<<"
-        info ">>> SRE 演练成功! <<<"
-        info "========================================="
-        return 0
-      fi
+      check_abort || { warn "触发中止条件, 退出"; return 1; }
     else
       info "DRY-RUN: 观测 #${tick}"
     fi
@@ -548,7 +601,8 @@ main() {
   phase_long_tx
   phase_dead_tuples
   phase_verify
-  phase_observe
+  phase_workload       # 启动模拟业务流量
+  phase_observe        # 等 SRE 定位恢复
 }
 
 main "$@"
