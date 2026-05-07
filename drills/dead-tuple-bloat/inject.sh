@@ -88,6 +88,7 @@ cleanup() {
     kill "${LONG_TX_PID}" 2>/dev/null || true
     wait "${LONG_TX_PID}" 2>/dev/null || true
   fi
+  rm -f /tmp/fault_drill_long_tx_*.sql 2>/dev/null || true
 
   # 2) 数据库侧兜底: 按 application_name 杀所有演练会话
   if [[ "${DRY_RUN}" != "true" ]]; then
@@ -197,6 +198,7 @@ phase_seed() {
   fi
   sql "DROP TABLE IF EXISTS ${SCHEMA}.${TABLE};"
 
+  # 必须用 ASTORE — ustore 原地更新不产生死元组, 演练无效
   sql "CREATE TABLE ${SCHEMA}.${TABLE} (
          id         BIGSERIAL      PRIMARY KEY,
          user_id    INT            NOT NULL,
@@ -206,7 +208,7 @@ phase_seed() {
          created_at TIMESTAMP      NOT NULL DEFAULT now(),
          updated_at TIMESTAMP      NOT NULL DEFAULT now(),
          padding    VARCHAR(200)   NOT NULL DEFAULT repeat('x', 200)
-       );"
+       ) WITH (STORAGE_TYPE=ASTORE);"
 
   sql "CREATE INDEX idx_drill_status ON ${SCHEMA}.${TABLE}(status);"
   sql "CREATE INDEX idx_drill_user   ON ${SCHEMA}.${TABLE}(user_id);"
@@ -285,18 +287,22 @@ phase_long_tx() {
     return 0
   fi
 
-  # 后台开事务: 用 echo + 管道送 SQL, 一个连接内顺序执行
-  # 注意: 不用 heredoc 避免注释和特殊字符解析问题
+  # 后台开事务: 写临时 SQL 文件, gsql -f 执行确保单连接内顺序执行
+  # 用 REPEATABLE READ 强制 pin 住快照, 阻止 autovacuum 回收
+  local tx_sql_file="/tmp/fault_drill_long_tx_$$.sql"
+  cat > "${tx_sql_file}" <<EOF
+SET application_name = 'fault_drill_long_tx';
+START TRANSACTION ISOLATION LEVEL REPEATABLE READ;
+SELECT count(*) FROM ${SCHEMA}.${TABLE} WHERE status = 'pending';
+SELECT pg_sleep(86400);
+COMMIT;
+EOF
   (
-    printf "%s\n" \
-      "SET application_name = 'fault_drill_long_tx';" \
-      "BEGIN;" \
-      "SELECT count(*) FROM ${SCHEMA}.${TABLE} WHERE status = 'pending';" \
-      "SELECT pg_sleep(86400);" \
-    | ${GSQL}
+    ${GSQL} -f "${tx_sql_file}"
+    rm -f "${tx_sql_file}"
   ) &
   LONG_TX_PID=$!
-  sleep 3
+  sleep 5
 
   # pg_sleep 是阻塞调用, 事务状态是 active 不是 idle in transaction
   LONG_TX_BACKEND=$(sql "SELECT pid FROM pg_stat_activity
