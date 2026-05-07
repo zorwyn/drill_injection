@@ -619,48 +619,75 @@ phase_workload() {
 # ── Phase 7: 观测等待 (SRE 定位时间) ─────────────────────────────────────────
 phase_observe() {
   info "╔═══════════════════════════════════════════════════╗"
-  info "║  故障已注入, 业务流量运行中                       ║"
+  info "║  业务系统出现异常, 请排查                         ║"
   info "║                                                   ║"
-  info "║  SRE 应该能观察到:                                ║"
-  info "║    1. WORKLOAD 日志中查询耗时逐渐升高             ║"
-  info "║    2. 部分查询出现 * slow 或 !! SLOW !! 标记      ║"
+  info "║  现象: 部分业务查询响应时间异常升高               ║"
+  info "║  影响: 用户反馈页面卡顿, 订单查询超时             ║"
   info "║                                                   ║"
-  info "║  SRE 需要:                                        ║"
-  info "║    - 自己开一个 gsql 去排查                       ║"
-  info "║    - 找到根因 (长事务 → 死元组)                   ║"
-  info "║    - 手动恢复 (kill 长事务 + VACUUM)              ║"
-  info "║                                                   ║"
-  info "║  演练出题人: Ctrl+C 退出 → 自动清理               ║"
+  info "║  请登录数据库排查并恢复                           ║"
+  info "║  Ctrl+C 结束演练 → 自动清理                       ║"
   info "╚═══════════════════════════════════════════════════╝"
 
   local tick=0
+  local start_epoch
+  start_epoch=$(date +%s)
+
   while true; do
     tick=$((tick + 1))
 
     if [[ "${DRY_RUN}" != "true" ]]; then
-      # 每隔 OBSERVE_INTERVAL 做一轮后台指标采集 (不干扰 workload 输出)
-      # 只在关键节点打日志, 不刷屏
+      # 只打现象层指标, 不暴露根因
       if (( tick % 4 == 0 )); then
         echo ""
-        info "── 后台指标 #${tick} ──"
-        local dead_tup tx_alive
+        local now_epoch elapsed_min
+        now_epoch=$(date +%s)
+        elapsed_min=$(( (now_epoch - start_epoch) / 60 ))
 
+        # 采集一条代表性查询的实际耗时
+        local probe_ms
+        probe_ms=$(bench_ms "$(get_query 1)")
+
+        info "── 告警 #${tick}  已持续 ${elapsed_min} 分钟 ──"
+        info "业务查询响应: ${probe_ms} ms"
+
+        # 根据耗时给出告警级别, 模拟真实监控
+        if [[ ${probe_ms} -ge 1000 ]]; then
+          info "告警级别: P1 - 严重 (响应 > 1s)"
+        elif [[ ${probe_ms} -ge 200 ]]; then
+          info "告警级别: P2 - 警告 (响应 > 200ms)"
+        else
+          info "告警级别: 正常"
+        fi
+
+        # 静默检测 SRE 是否已恢复 (不打印死元组/长事务信息)
+        local dead_tup tx_alive
         dead_tup=$(sql "SELECT n_dead_tup FROM pg_stat_user_tables
-                        WHERE schemaname='${SCHEMA}' AND relname='${TABLE}';")
+                        WHERE schemaname='${SCHEMA}' AND relname='${TABLE}'")
         tx_alive=$(sql "SELECT count(*) FROM pg_stat_activity
                         WHERE application_name = 'fault_drill_long_tx'")
 
-        info "死元组: ${dead_tup} | 长事务存活: ${tx_alive}"
-
-        # 检测 SRE 是否已恢复
         if [[ "${dead_tup}" -lt 1000 ]] && [[ "${tx_alive}" == "0" ]]; then
+          # 再等一轮确认不是误判
+          sleep "${OBSERVE_INTERVAL}"
+          probe_ms=$(bench_ms "$(get_query 1)")
+          local base_times=()
+          if [[ -f "${BASELINE_FILE}" ]]; then
+            while IFS= read -r line; do base_times+=("${line}"); done < "${BASELINE_FILE}"
+          fi
+          local base_ms="${base_times[1]:-1}"
+
           echo ""
-          info "╔═══════════════════════════════════════╗"
-          info "║  SRE 演练完成!                        ║"
-          info "║  长事务已终止, 死元组已回收            ║"
-          info "╚═══════════════════════════════════════╝"
-          info "等待 30s 确认业务流量恢复正常..."
-          sleep 30
+          info "╔═══════════════════════════════════════════════════╗"
+          info "║  演练结束!                                        ║"
+          info "║                                                   ║"
+          info "║  恢复耗时: ${elapsed_min} 分钟                             ║"
+          info "║  业务查询: 基线 ${base_ms} ms → 当前 ${probe_ms} ms           ║"
+          if [[ ${probe_ms} -le $(( base_ms * 2 )) ]]; then
+            info "║  状态: 已恢复正常 ✓                               ║"
+          else
+            info "║  状态: 部分恢复, 建议 VACUUM ANALYZE              ║"
+          fi
+          info "╚═══════════════════════════════════════════════════╝"
           return 0
         fi
       fi
