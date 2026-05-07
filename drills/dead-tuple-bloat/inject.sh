@@ -189,7 +189,12 @@ phase_precheck() {
 phase_seed() {
   info "===== Phase 1: 创建种子数据 (${SEED_ROWS} 行) ====="
 
-  sql "CREATE SCHEMA IF NOT EXISTS ${SCHEMA};"
+  # GaussDB 不支持 CREATE SCHEMA IF NOT EXISTS, 先判断再建
+  local schema_exists
+  schema_exists=$(sql "SELECT count(*) FROM pg_namespace WHERE nspname='${SCHEMA}'")
+  if [[ "${schema_exists}" == "0" ]] || [[ "${DRY_RUN}" == "true" ]]; then
+    sql "CREATE SCHEMA ${SCHEMA};"
+  fi
   sql "DROP TABLE IF EXISTS ${SCHEMA}.${TABLE};"
 
   sql "CREATE TABLE ${SCHEMA}.${TABLE} (
@@ -308,8 +313,8 @@ phase_long_tx() {
 
   info "长事务已启动 (shell_pid=${LONG_TX_PID}, backend_pid=${LONG_TX_BACKEND})"
 
-  # 显示 xmin 信息, 确认快照已固定
-  sql "SELECT pid, backend_xmin, age(backend_xmin) AS xmin_age
+  # 确认长事务会话状态
+  sql "SELECT pid, state, xact_start, now() - xact_start AS tx_duration
        FROM pg_stat_activity
        WHERE pid = ${LONG_TX_BACKEND};"
   info "长事务注入完成 ✓"
@@ -433,12 +438,12 @@ phase_verify() {
 
   # autovacuum 阻塞确认
   info "── autovacuum 阻塞状态 ──"
-  sql_verbose "SELECT pid, state, backend_xmin,
+  sql_verbose "SELECT pid, state, xact_start,
       now() - query_start AS duration,
       application_name, left(query, 80) AS query
     FROM pg_stat_activity
     WHERE application_name = 'fault_drill_long_tx'
-       OR query ILIKE '%autovacuum%${TABLE}%';"
+       OR query LIKE '%autovacuum%${TABLE}%';"
 
   info "故障验证完成 ✓"
 }
