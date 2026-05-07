@@ -1,0 +1,106 @@
+{
+  "version": "1.0",
+  "objective": "验证长事务导致死元组积压后对查询计划生成性能的影响，模拟故障链路：长事务持有旧快照 → autovacuum无法回收死元组 → 表膨胀导致优化器代价估算偏差 → SQL整体变慢",
+  "environment": {
+    "name": "__ENV_NAME__",
+    "type": "staging",
+    "approval": "manual",
+    "window": "__WINDOW__"
+  },
+  "topology": {
+    "cluster": "__CLUSTER__",
+    "roles": ["cn", "dn"],
+    "primary_host": "__PRIMARY_DN__",
+    "standby_hosts": ["__STANDBY_DN__"]
+  },
+  "targets": [
+    {
+      "host": "__PRIMARY_DN__",
+      "role": "dn",
+      "scope": "database",
+      "selector": "db=__DATABASE__"
+    }
+  ],
+  "fault": {
+    "scenario": "dead-tuple-bloat",
+    "mechanism": "sql-multi-phase",
+    "duration_min": 20,
+    "parameters": {
+      "database": "__DATABASE__",
+      "schema": "fault_drill",
+      "table": "drill_orders",
+      "seed_rows": 500000,
+      "update_rows": 200000,
+      "update_rounds": 5,
+      "txn_hold_sec": 900
+    }
+  },
+  "guards": {
+    "dry_run": true,
+    "max_nodes": 1,
+    "abort_conditions": [
+      "replication lag > 60s",
+      "connection count > 80% max_connections",
+      "disk usage > 85%",
+      "long transaction hold time > 1200s"
+    ],
+    "timeouts": {
+      "inject_s": 1200,
+      "rollback_s": 300
+    }
+  },
+  "observability": {
+    "metrics": [
+      "pg_stat_user_tables.n_dead_tup",
+      "pg_stat_activity long tx count",
+      "EXPLAIN total_cost delta",
+      "sql p95 latency",
+      "autovacuum worker state",
+      "table bloat ratio",
+      "replication lag",
+      "connection count"
+    ],
+    "logs": ["gaussdb log", "autovacuum log"],
+    "alerts": ["long-transaction", "sql-latency-high", "replication-lag"]
+  },
+  "verification": {
+    "prechecks": [
+      "confirm target is staging environment",
+      "confirm drill schema fault_drill exists or can be created",
+      "confirm autovacuum is enabled on target table",
+      "confirm current dead tuple count baseline",
+      "confirm current EXPLAIN cost baseline for test query",
+      "confirm no existing long transactions on target DB"
+    ],
+    "during_checks": [
+      "sample n_dead_tup every 30s",
+      "run EXPLAIN on test query every 60s and record cost",
+      "monitor autovacuum state (should be blocked by long tx)",
+      "monitor xid age and snapshot oldest xmin",
+      "sample sql p95 latency every 30s"
+    ],
+    "success_conditions": [
+      "dead tuple count exceeds 500000",
+      "EXPLAIN cost increases by > 50% from baseline",
+      "autovacuum is visibly blocked during injection",
+      "sql latency degrades measurably"
+    ]
+  },
+  "rollback": {
+    "mode": "on-exit",
+    "trigger": "trap EXIT INT TERM HUP — 脚本退出即清理，无需超时计时器",
+    "steps": [
+      "terminate the long-holding session via pg_terminate_backend",
+      "terminate all sessions with application_name=fault_drill_long_tx",
+      "VACUUM ANALYZE the target table",
+      "confirm dead tuple count drops to near zero",
+      "confirm EXPLAIN cost returns to baseline range"
+    ],
+    "success_conditions": [
+      "no long transactions remain on target DB",
+      "dead tuple count < 1000",
+      "EXPLAIN cost within 20% of baseline",
+      "sql p95 latency returns to baseline"
+    ]
+  }
+}

@@ -1,0 +1,4 @@
+interface:
+  display_name: "GaussDB Fault Injection"
+  short_description: "Generate safe GaussDB fault drills"
+  default_prompt: "Use $gaussdb-fault-injection to turn this drill idea into a safe plan, script, and rollback checklist."

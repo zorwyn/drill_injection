@@ -1,0 +1,83 @@
+{
+  "version": "1.0",
+  "objective": "Observe DN behavior under temporary disk fill pressure",
+  "environment": {
+    "name": "staging-1",
+    "type": "staging",
+    "approval": "manual",
+    "window": "2026-05-07T10:00:00+08:00/2026-05-07T10:30:00+08:00"
+  },
+  "topology": {
+    "cluster": "gaussdb-stg",
+    "roles": ["cn", "dn"],
+    "primary_host": "dn-01",
+    "standby_hosts": ["dn-02"]
+  },
+  "targets": [
+    {
+      "host": "dn-01",
+      "role": "dn",
+      "scope": "tablespace-mount",
+      "selector": "mount=/gaussdb/data"
+    }
+  ],
+  "fault": {
+    "scenario": "disk-fill",
+    "mechanism": "fallocate",
+    "duration_min": 15,
+    "parameters": {
+      "path": "/gaussdb_fault/drill.bin",
+      "bytes": "20G",
+      "min_free_gb": 20
+    }
+  },
+  "guards": {
+    "dry_run": true,
+    "max_nodes": 1,
+    "abort_conditions": [
+      "replication lag > 30s",
+      "disk free < 15G",
+      "failover starts"
+    ],
+    "timeouts": {
+      "inject_s": 900,
+      "rollback_s": 120
+    }
+  },
+  "observability": {
+    "metrics": [
+      "replication lag",
+      "sql p95 latency",
+      "disk usage",
+      "iowait",
+      "connection errors"
+    ],
+    "logs": ["gaussdb log", "kernel dmesg"],
+    "alerts": ["replication-lag", "disk-usage-high"]
+  },
+  "verification": {
+    "prechecks": [
+      "verify target host role",
+      "verify rollback path exists"
+    ],
+    "during_checks": [
+      "sample metrics every 30s"
+    ],
+    "success_conditions": [
+      "fault takes effect",
+      "cluster stays reachable"
+    ]
+  },
+  "rollback": {
+    "mode": "automatic",
+    "steps": [
+      "delete filler file",
+      "sync and recheck disk free",
+      "clear injected state"
+    ],
+    "success_conditions": [
+      "disk free returns above threshold",
+      "alerts recover"
+    ]
+  }
+}

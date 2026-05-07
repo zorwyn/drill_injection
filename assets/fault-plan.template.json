@@ -1,0 +1,54 @@
+{
+  "version": "1.0",
+  "objective": "__OBJECTIVE__",
+  "environment": {
+    "name": "__ENV_NAME__",
+    "type": "staging",
+    "approval": "manual",
+    "window": "__WINDOW__"
+  },
+  "topology": {
+    "cluster": "__CLUSTER__",
+    "roles": ["cn", "dn"],
+    "primary_host": "__PRIMARY_HOST__",
+    "standby_hosts": ["__STANDBY_HOST__"]
+  },
+  "targets": [
+    {
+      "host": "__TARGET_HOST__",
+      "role": "__TARGET_ROLE__",
+      "scope": "__TARGET_SCOPE__",
+      "selector": "__TARGET_SELECTOR__"
+    }
+  ],
+  "fault": {
+    "scenario": "__SCENARIO__",
+    "mechanism": "__MECHANISM__",
+    "duration_min": 15,
+    "parameters": {}
+  },
+  "guards": {
+    "dry_run": true,
+    "max_nodes": 1,
+    "abort_conditions": ["__ABORT_CONDITION__"],
+    "timeouts": {
+      "inject_s": 900,
+      "rollback_s": 120
+    }
+  },
+  "observability": {
+    "metrics": ["__METRIC__"],
+    "logs": ["__LOG_SOURCE__"],
+    "alerts": ["__ALERT_NAME__"]
+  },
+  "verification": {
+    "prechecks": ["__PRECHECK__"],
+    "during_checks": ["__DURING_CHECK__"],
+    "success_conditions": ["__SUCCESS_CONDITION__"]
+  },
+  "rollback": {
+    "mode": "automatic",
+    "steps": ["__ROLLBACK_STEP__"],
+    "success_conditions": ["__ROLLBACK_SUCCESS__"]
+  }
+}
