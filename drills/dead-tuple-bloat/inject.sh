@@ -29,15 +29,31 @@ DROP_ON_EXIT="${DROP_ON_EXIT:-false}"          # true=退出时删除演练 sche
 WORKLOAD_INTERVAL="${WORKLOAD_INTERVAL:-3}"    # 模拟业务流量间隔 (秒)
 WORKLOAD_CONCURRENCY="${WORKLOAD_CONCURRENCY:-4}"  # 模拟业务并发数
 
+# ── 5 条标准查询 (基线、验证、workload 共用) ─────────────────────────────────
+# 注意: 这里用占位符, phase_seed 之后再用 SCHEMA/TABLE 展开
+QUERY_NAMES=("点查" "条件聚合" "TOP-N" "用户订单" "多维汇总")
+
+# 返回第 i 条查询 SQL (需要在 SCHEMA/TABLE 赋值后调用)
+get_query() {
+  local i=$1
+  case $i in
+    0) echo "SELECT * FROM ${SCHEMA}.${TABLE} WHERE id = 1" ;;
+    1) echo "SELECT count(*), avg(amount) FROM ${SCHEMA}.${TABLE} WHERE status='pending' AND region='east'" ;;
+    2) echo "SELECT user_id, sum(amount) FROM ${SCHEMA}.${TABLE} WHERE status IN ('pending','paid') GROUP BY user_id ORDER BY sum(amount) DESC LIMIT 20" ;;
+    3) echo "SELECT * FROM ${SCHEMA}.${TABLE} WHERE user_id = 42 AND status = 'paid' ORDER BY created_at DESC LIMIT 10" ;;
+    4) echo "SELECT region, status, count(*), avg(amount) FROM ${SCHEMA}.${TABLE} GROUP BY region, status ORDER BY count(*) DESC" ;;
+  esac
+}
+
 # ── 内部状态 ──────────────────────────────────────────────────────────────────
 LONG_TX_PID=""
 LONG_TX_BACKEND=""
 INJECTED=false
 SEED_CREATED=false
-BASELINE_COST=""
 BASELINE_DEAD=""
-BASELINE_FILE="/tmp/fault_drill_baseline_$$.dat"  # 基线耗时文件, 供 workload 读取
-WORKLOAD_PIDS=()                               # 后台业务流量进程 PID
+BASELINE_FILE="/tmp/fault_drill_baseline_$$.dat"     # 基线耗时
+BASELINE_PLAN_DIR="/tmp/fault_drill_plans_$$"         # 基线 EXPLAIN 计划
+WORKLOAD_PIDS=()                                      # 后台业务流量进程 PID
 
 # ── 工具函数 ──────────────────────────────────────────────────────────────────
 log()  { printf '[%s] %s\n' "$(date '+%F %T')" "$*"; }
@@ -88,6 +104,7 @@ cleanup() {
     wait "${LONG_TX_PID}" 2>/dev/null || true
   fi
   rm -f /tmp/fault_drill_long_tx_*.sql /tmp/fault_drill_baseline_*.dat 2>/dev/null || true
+  rm -rf /tmp/fault_drill_plans_* 2>/dev/null || true
 
   # 2) 数据库侧兜底: 按 application_name 杀所有演练会话
   if [[ "${DRY_RUN}" != "true" ]]; then
@@ -247,16 +264,6 @@ bench_ms() {
 phase_baseline() {
   info "===== Phase 2: 记录基线 ====="
 
-  # 和 workload 完全一致的 5 条查询
-  local baseline_queries=(
-    "SELECT * FROM ${SCHEMA}.${TABLE} WHERE id = 1"
-    "SELECT count(*), avg(amount) FROM ${SCHEMA}.${TABLE} WHERE status='pending' AND region='east'"
-    "SELECT user_id, sum(amount) FROM ${SCHEMA}.${TABLE} WHERE status IN ('pending','paid') GROUP BY user_id ORDER BY sum(amount) DESC LIMIT 20"
-    "SELECT * FROM ${SCHEMA}.${TABLE} WHERE user_id = 42 AND status = 'paid' ORDER BY created_at DESC LIMIT 10"
-    "SELECT region, status, count(*), avg(amount) FROM ${SCHEMA}.${TABLE} GROUP BY region, status ORDER BY count(*) DESC"
-  )
-  local baseline_names=("点查" "条件聚合" "TOP-N" "用户订单" "多维汇总")
-
   if [[ "${DRY_RUN}" != "true" ]]; then
     BASELINE_DEAD=$(sql "SELECT n_dead_tup FROM pg_stat_user_tables
                          WHERE schemaname='${SCHEMA}' AND relname='${TABLE}'")
@@ -267,18 +274,25 @@ phase_baseline() {
                     '${SCHEMA}.${TABLE}'))")
     info "基线表大小: ${tbl_size}"
 
-    # 跑 5 条查询, 记录基线耗时, 写入文件供 workload 读取
-    info "┌─────────────────────────────────────┐"
-    info "│         基线耗时采集                │"
+    # 跑 5 条查询: 记录耗时 + 保存 EXPLAIN 计划
+    mkdir -p "${BASELINE_PLAN_DIR}"
     > "${BASELINE_FILE}"
-    for i in "${!baseline_queries[@]}"; do
+
+    info "┌──────────────────────────────────────────────────┐"
+    info "│         基线采集 (耗时 + EXPLAIN 计划)           │"
+    for i in 0 1 2 3 4; do
+      local q
+      q=$(get_query $i)
       local ms
-      ms=$(bench_ms "${baseline_queries[$i]}")
+      ms=$(bench_ms "${q}")
       echo "${ms}" >> "${BASELINE_FILE}"
-      info "│ ${baseline_names[$i]}:  ${ms} ms"
+
+      # 保存 EXPLAIN ANALYZE 计划到文件
+      sql_verbose "EXPLAIN ANALYZE ${q}" > "${BASELINE_PLAN_DIR}/${i}.txt" 2>&1
+
+      info "│ ${QUERY_NAMES[$i]}:  ${ms} ms"
     done
-    info "└─────────────────────────────────────┘"
-    info "基线已写入 ${BASELINE_FILE}"
+    info "└──────────────────────────────────────────────────┘"
   else
     info "DRY-RUN: 跳过基线采集"
   fi
@@ -390,7 +404,7 @@ phase_dead_tuples() {
   info "死元组注入完成 ✓"
 }
 
-# ── Phase 5: 验证故障效果 ────────────────────────────────────────────────────
+# ── Phase 5: 验证故障效果 (同样 5 条查询, 前后对比) ──────────────────────────
 phase_verify() {
   info "===== Phase 5: 验证故障效果 ====="
 
@@ -402,8 +416,10 @@ phase_verify() {
     return 0
   fi
 
-  # 表统计
-  info "── 表膨胀统计 ──"
+  # ── 表膨胀统计 ──
+  info "┌──────────────────────────────────────────────────┐"
+  info "│                  表膨胀统计                      │"
+  info "├──────────────────────────────────────────────────┤"
   sql_verbose "SELECT
       n_live_tup,
       n_dead_tup,
@@ -414,50 +430,70 @@ phase_verify() {
       last_autovacuum,
       last_autoanalyze
     FROM pg_stat_user_tables
-    WHERE schemaname = '${SCHEMA}' AND relname = '${TABLE}';"
+    WHERE schemaname = '${SCHEMA}' AND relname = '${TABLE}'"
+  info "└──────────────────────────────────────────────────┘"
 
-  # 查询计划退化对比
-  info "── 查询计划对比 (vs 基线) ──"
-  info "基线: ${BASELINE_COST}"
-  local current_cost
-  current_cost=$(sql "EXPLAIN SELECT count(*) FROM ${SCHEMA}.${TABLE}
-                      WHERE status='pending' AND region='east'
-                      GROUP BY user_id ORDER BY count(*) DESC LIMIT 10;" \
-                 | head -1)
-  info "当前: ${current_cost}"
+  # ── 5 条查询: 耗时 + 计划前后对比 ──
+  info ""
+  info "╔══════════════════════════════════════════════════╗"
+  info "║      5 条标准查询 — 注入前后对比                ║"
+  info "╚══════════════════════════════════════════════════╝"
 
-  # 典型查询 EXPLAIN ANALYZE
-  info "── 聚合查询计划 ──"
-  sql_verbose "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-    SELECT region, count(*), avg(amount)
-    FROM ${SCHEMA}.${TABLE}
-    WHERE status = 'pending'
-    GROUP BY region;"
+  # 读基线耗时
+  local base_times=()
+  if [[ -f "${BASELINE_FILE}" ]]; then
+    while IFS= read -r line; do
+      base_times+=("${line}")
+    done < "${BASELINE_FILE}"
+  fi
 
-  info "── 索引选择性查询计划 ──"
-  sql_verbose "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-    SELECT *
-    FROM ${SCHEMA}.${TABLE}
-    WHERE user_id = 42 AND status = 'paid'
-    ORDER BY created_at DESC
-    LIMIT 20;"
+  for i in 0 1 2 3 4; do
+    local q
+    q=$(get_query $i)
+    local qname="${QUERY_NAMES[$i]}"
+    local base_ms="${base_times[$i]:-?}"
 
-  info "── 自连接查询计划 ──"
-  sql_verbose "EXPLAIN (ANALYZE, BUFFERS, FORMAT TEXT)
-    SELECT a.id, a.amount, b.amount
-    FROM ${SCHEMA}.${TABLE} a
-    JOIN ${SCHEMA}.${TABLE} b ON a.user_id = b.user_id
-    WHERE a.status = 'shipped' AND b.status = 'done'
-    LIMIT 100;"
+    # 当前耗时
+    local now_ms
+    now_ms=$(bench_ms "${q}")
 
-  # autovacuum 阻塞确认
-  info "── autovacuum 阻塞状态 ──"
+    # 倍率
+    local ratio="?"
+    if [[ "${base_ms}" != "?" ]] && [[ "${base_ms}" -gt 0 ]]; then
+      local x=$(( now_ms * 10 / base_ms ))
+      ratio="$(( x / 10 )).$(( x % 10 ))x"
+    fi
+
+    info ""
+    info "── Q$((i+1)): ${qname} ──────────────────────────"
+    info "耗时:  基线 ${base_ms} ms → 当前 ${now_ms} ms  (${ratio})"
+
+    # 打印基线计划
+    if [[ -f "${BASELINE_PLAN_DIR}/${i}.txt" ]]; then
+      info ""
+      info "[基线计划]"
+      while IFS= read -r line; do
+        [[ -n "${line}" ]] && info "  ${line}"
+      done < "${BASELINE_PLAN_DIR}/${i}.txt"
+    fi
+
+    # 打印当前计划
+    info ""
+    info "[当前计划]"
+    sql_verbose "EXPLAIN ANALYZE ${q}" 2>&1 | while IFS= read -r line; do
+      [[ -n "${line}" ]] && info "  ${line}"
+    done
+  done
+
+  # ── 长事务 + autovacuum 状态 ──
+  info ""
+  info "── 长事务 & autovacuum 状态 ──"
   sql_verbose "SELECT pid, state, xact_start,
-      now() - query_start AS duration,
+      now() - xact_start AS tx_duration,
       application_name, left(query, 80) AS query
     FROM pg_stat_activity
     WHERE application_name = 'fault_drill_long_tx'
-       OR query LIKE '%autovacuum%${TABLE}%';"
+       OR query LIKE '%autovacuum%${TABLE}%'"
 
   info "故障验证完成 ✓"
 }
@@ -472,16 +508,6 @@ workload_worker() {
   local gsql_cmd=$5
   local baseline_file=$6
 
-  # 和基线采集完全一致的 5 条查询
-  local queries=(
-    "SELECT * FROM ${schema}.${table} WHERE id = (random()*500000)::int + 1"
-    "SELECT count(*), avg(amount) FROM ${schema}.${table} WHERE status='pending' AND region='east'"
-    "SELECT user_id, sum(amount) FROM ${schema}.${table} WHERE status IN ('pending','paid') GROUP BY user_id ORDER BY sum(amount) DESC LIMIT 20"
-    "SELECT * FROM ${schema}.${table} WHERE user_id = (random()*10000)::int AND status = 'paid' ORDER BY created_at DESC LIMIT 10"
-    "SELECT region, status, count(*), avg(amount) FROM ${schema}.${table} GROUP BY region, status ORDER BY count(*) DESC"
-  )
-  local query_names=("点查" "条件聚合" "TOP-N" "用户订单" "多维汇总")
-
   # 读基线文件 (5 行, 每行一个 ms 数)
   local baselines=()
   if [[ -f "${baseline_file}" ]]; then
@@ -491,13 +517,15 @@ workload_worker() {
   fi
 
   while true; do
-    local idx=$(( RANDOM % ${#queries[@]} ))
-    local qname="${query_names[$idx]}"
+    local idx=$(( RANDOM % 5 ))
+    local qname="${QUERY_NAMES[$idx]}"
     local base_ms="${baselines[$idx]:-?}"
+    local q
+    q=$(get_query $idx)
 
     local start_ns end_ns elapsed_ms
     start_ns=$(date +%s%N 2>/dev/null || date +%s)
-    ${gsql_cmd} -t -A -c "${queries[$idx]}" >/dev/null 2>&1
+    ${gsql_cmd} -t -A -c "${q}" >/dev/null 2>&1
     end_ns=$(date +%s%N 2>/dev/null || date +%s)
 
     if [[ ${#start_ns} -gt 10 ]]; then
