@@ -28,6 +28,7 @@ WORKLOAD_CONCURRENCY="${WORKLOAD_CONCURRENCY:-4}"
 DDL_INTERVAL="${DDL_INTERVAL:-5}"              # DDL 冲突制造间隔 (秒)
 DDL_CONCURRENCY="${DDL_CONCURRENCY:-3}"        # DDL 并发数
 ABORT_CONN_PCT="${ABORT_CONN_PCT:-80}"
+STATEMENT_TIMEOUT_MS="${STATEMENT_TIMEOUT_MS:-10000}"  # 业务/DDL SQL 等锁超时 (ms), 避免无限挂起
 DROP_ON_EXIT="${DROP_ON_EXIT:-false}"
 
 # ── 标准查询 ─────────────────────────────────────────────────────────────────
@@ -77,7 +78,8 @@ sql_verbose() {
 bench_ms() {
   local start_ns end_ns elapsed
   start_ns=$(date +%s%N 2>/dev/null || date +%s)
-  ${GSQL} -t -A -c "$1" >/dev/null 2>&1
+  # statement_timeout 防止被持锁会话无限阻塞
+  ${GSQL} -t -A -c "SET statement_timeout = ${STATEMENT_TIMEOUT_MS}; $1" >/dev/null 2>&1
   end_ns=$(date +%s%N 2>/dev/null || date +%s)
   if [[ ${#start_ns} -gt 10 ]]; then
     elapsed=$(( (end_ns - start_ns) / 1000000 ))
@@ -116,12 +118,10 @@ cleanup() {
     wait "${BACKUP_PID}" 2>/dev/null || true
   fi
 
-  # 3) 数据库侧: 停止备份 + 杀残留会话
+  # 3) 数据库侧: 杀残留会话 (释放表锁)
   if [[ "${DRY_RUN}" != "true" ]]; then
     info "[清理 4/5] 数据库侧清理"
-    # 停止备份状态
-    sql "SELECT pg_stop_backup();" 2>/dev/null || true
-    # 杀所有演练会话
+    # 杀所有演练会话, 释放 ACCESS EXCLUSIVE 锁
     sql "SELECT pg_terminate_backend(pid)
          FROM pg_stat_activity
          WHERE application_name IN ('fault_drill_backup', 'fault_drill_ddl')
@@ -170,14 +170,20 @@ phase_precheck() {
     sql "SELECT 1" >/dev/null || { err "无法连接数据库"; exit 1; }
     info "数据库连接 ✓"
 
-    # 检查是否已有备份在跑
-    local backup_in_progress
-    backup_in_progress=$(sql "SELECT pg_is_in_backup();" 2>/dev/null || echo "")
-    if [[ "${backup_in_progress}" == "t" ]]; then
-      err "数据库已有备份在进行中, 请先处理后再演练"
-      exit 1
+    # 检查是否有遗留的演练会话 (上次没清理干净)
+    local stale_count
+    stale_count=$(sql "SELECT count(*) FROM pg_stat_activity
+                       WHERE application_name IN ('fault_drill_backup', 'fault_drill_ddl')" \
+                       2>/dev/null | tr -d ' ')
+    if [[ -n "${stale_count}" ]] && (( stale_count > 0 )); then
+      warn "发现 ${stale_count} 个遗留的演练会话, 自动清理中..."
+      sql "SELECT pg_terminate_backend(pid)
+           FROM pg_stat_activity
+           WHERE application_name IN ('fault_drill_backup', 'fault_drill_ddl')
+             AND pid <> pg_backend_pid();" || true
+      sleep 2
     fi
-    info "无进行中的备份 ✓"
+    info "无遗留的演练会话 ✓"
 
     check_abort || { err "中止条件未通过"; exit 1; }
   fi
@@ -264,17 +270,22 @@ phase_inject_backup() {
   info "===== Phase 3: 注入卡住的备份任务 ====="
 
   if [[ "${DRY_RUN}" == "true" ]]; then
-    info "DRY-RUN: 将调用 pg_start_backup 并 hold 住, 模拟备份卡死"
+    info "DRY-RUN: 将启动一个'备份'会话持有表级排他锁, 模拟备份任务持有 BarrierLock"
     return 0
   fi
 
-  # 后台会话: 开始备份但永不结束
+  # 关键: pg_start_backup() 默认是 non-exclusive 模式, 不会阻塞业务 SQL,
+  # 注入不出真实的锁等待。
+  # 改用 LOCK TABLE ... IN ACCESS EXCLUSIVE MODE 来制造真实的全表锁等待。
+  # 故事仍然是"备份会话卡住" (application_name='fault_drill_backup'),
+  # SRE 排查路径不变: pg_locks 找到持锁会话 → 终止 → 恢复。
   local backup_sql="/tmp/fault_drill_backup_$$.sql"
   cat > "${backup_sql}" <<EOF
 SET application_name = 'fault_drill_backup';
-SELECT pg_start_backup('fault_drill_stuck_backup', true);
+START TRANSACTION;
+LOCK TABLE ${SCHEMA}.${TABLE} IN ACCESS EXCLUSIVE MODE;
 SELECT pg_sleep(86400);
-SELECT pg_stop_backup();
+COMMIT;
 EOF
 
   (
@@ -299,16 +310,18 @@ EOF
 
   info "备份任务已卡住 (shell_pid=${BACKUP_PID}, backend_pid=${BACKUP_BACKEND})"
 
-  # 确认备份状态
-  local in_backup
-  in_backup=$(sql "SELECT pg_is_in_backup();" 2>/dev/null || echo "unknown")
-  info "pg_is_in_backup(): ${in_backup}"
+  # 验证锁已经持有 (应该看到 ${SCHEMA}.${TABLE} 上的 AccessExclusiveLock)
+  info "── 持锁情况 ──"
+  sql_verbose "SELECT locktype, relation::regclass, mode, granted
+               FROM pg_locks
+               WHERE pid = ${BACKUP_BACKEND}
+                 AND locktype = 'relation'"
 
-  sql "SELECT pid, state, application_name,
+  sql_verbose "SELECT pid, state, application_name,
        now() - xact_start AS duration, left(query, 60) AS query
        FROM pg_stat_activity WHERE pid = ${BACKUP_BACKEND}"
 
-  info "备份注入完成 ✓"
+  info "备份注入完成 ✓ (业务 SQL 即将开始等锁)"
 }
 
 # ── Phase 4: DDL 冲突制造器 ──────────────────────────────────────────────────
@@ -341,7 +354,8 @@ ddl_conflict_worker() {
 
     local start_ns end_ns elapsed_ms
     start_ns=$(date +%s%N 2>/dev/null || date +%s)
-    ${gsql_cmd} -c "SET application_name = 'fault_drill_ddl'; ${ddl_ops[$idx]};" >/dev/null 2>&1
+    # DDL 操作也加超时, 否则会被表锁卡到 backup_hold_sec 那么久
+    ${gsql_cmd} -c "SET application_name = 'fault_drill_ddl'; SET statement_timeout = ${STATEMENT_TIMEOUT_MS}; ${ddl_ops[$idx]};" >/dev/null 2>&1
     end_ns=$(date +%s%N 2>/dev/null || date +%s)
 
     if [[ ${#start_ns} -gt 10 ]]; then
@@ -385,7 +399,8 @@ workload_worker() {
 
     local start_ns end_ns elapsed_ms
     start_ns=$(date +%s%N 2>/dev/null || date +%s)
-    ${gsql_cmd} -t -A -c "${q}" >/dev/null 2>&1
+    # statement_timeout 防止业务查询被锁住后无限挂起
+    ${gsql_cmd} -t -A -c "SET statement_timeout = ${STATEMENT_TIMEOUT_MS}; ${q}" >/dev/null 2>&1
     end_ns=$(date +%s%N 2>/dev/null || date +%s)
 
     if [[ ${#start_ns} -gt 10 ]]; then
@@ -528,7 +543,8 @@ phase_verify() {
     fi
 
     info "[当前计划]"
-    sql_verbose "EXPLAIN ANALYZE ${q}" 2>&1 | while IFS= read -r line; do
+    # EXPLAIN ANALYZE 也加超时, 否则被锁住会卡很久
+    sql_verbose "SET statement_timeout = ${STATEMENT_TIMEOUT_MS}; EXPLAIN ANALYZE ${q}" 2>&1 | while IFS= read -r line; do
       [[ -n "${line}" ]] && info "  ${line}"
     done
   done
@@ -620,14 +636,14 @@ phase_observe() {
           info "告警级别: 正常"
         fi
 
-        # 静默检测恢复: 备份已停止
-        local in_backup
-        in_backup=$(sql "SELECT pg_is_in_backup();" 2>/dev/null || echo "t")
-        local backup_alive
+        # 静默检测恢复: 持锁的备份会话已被终止
+        local backup_alive=0
         backup_alive=$(sql "SELECT count(*) FROM pg_stat_activity
-                            WHERE application_name = 'fault_drill_backup'")
+                            WHERE application_name = 'fault_drill_backup'" \
+                            2>/dev/null | tr -d ' ')
+        [[ "${backup_alive}" =~ ^[0-9]+$ ]] || backup_alive=0
 
-        if [[ "${in_backup}" != "t" ]] && [[ "${backup_alive}" == "0" ]]; then
+        if [[ "${backup_alive}" == "0" ]]; then
           sleep "${OBSERVE_INTERVAL}"
           probe_ms=$(bench_ms "$(get_query 2)")
           local base_times=()

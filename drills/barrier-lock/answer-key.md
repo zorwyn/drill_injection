@@ -49,24 +49,30 @@ SRE 应该看到:
 - 它们的 wait_duration 持续增长
 - locktype 中有 `relation` 锁堆积, 多源自一个 backup 会话持有的全局锁
 
-### 第二步: 检查备份状态
+### 第二步: 找到持锁的源头会话
 
 ```sql
--- 是不是有备份在跑?
-SELECT pg_is_in_backup();
-
--- 如果是 true, 找到备份会话
+-- 看谁持有了 ACCESS EXCLUSIVE / 大粒度锁
 SELECT
-    pid,
-    state,
-    application_name,
-    now() - xact_start AS duration,
-    left(query, 80) AS query
-FROM pg_stat_activity
-WHERE query LIKE '%backup%'
-   OR application_name LIKE '%backup%'
-ORDER BY xact_start;
+    a.pid,
+    a.state,
+    a.application_name,
+    l.locktype,
+    l.relation::regclass AS relation,
+    l.mode,
+    l.granted,
+    now() - a.xact_start AS duration,
+    left(a.query, 80) AS query
+FROM pg_stat_activity a
+JOIN pg_locks l ON l.pid = a.pid
+WHERE l.granted = true
+  AND l.mode LIKE '%Exclusive%'
+  AND a.pid <> pg_backend_pid()
+ORDER BY duration DESC;
 ```
+
+应该看到一个 application_name='fault_drill_backup' 的会话长时间持有
+drill_txns 表上的 AccessExclusiveLock。
 
 ### 第三步: 确认因果关系
 
@@ -88,25 +94,23 @@ WHERE blocked.pid <> blocker.pid;
 
 ## SRE 应该怎么恢复
 
-### 第一步: 停止卡住的备份
+### 第一步: 终止持锁的备份会话
 
 ```sql
--- 方法 1: 正常停止备份
-SELECT pg_stop_backup();
-
--- 方法 2: 如果方法 1 不行, 杀备份会话
-SELECT pg_terminate_backend(<备份会话的pid>);
+-- 终止持锁会话, 锁会随事务一起释放
+SELECT pg_terminate_backend(<持锁会话的pid>);
 ```
 
 ### 第二步: 验证恢复
 
 ```sql
--- 确认备份状态已解除
-SELECT pg_is_in_backup();  -- 应该返回 false
+-- 确认持锁会话已退出
+SELECT count(*) FROM pg_stat_activity
+WHERE application_name = 'fault_drill_backup';  -- 应该是 0
 
 -- 确认没有等锁的会话了
-SELECT count(*) FROM pg_stat_activity
-WHERE wait_event IS NOT NULL AND state = 'active';
+SELECT count(DISTINCT pid) FROM pg_locks
+WHERE granted = false AND pid <> pg_backend_pid();
 
 -- 确认业务查询恢复正常
 -- (看 inject.sh 的 WORKLOAD 日志, 耗时应该降回基线)
