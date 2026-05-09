@@ -17,6 +17,7 @@ SUPPORTED_SCENARIOS = {
     "slow-query-burst": {"database", "concurrency", "duration_min"},
     "replication-lag": {"target_role", "mechanism", "duration_min"},
     "dead-tuple-bloat": {"database", "schema", "table", "update_rows", "txn_hold_sec"},
+    "barrier-lock": {"database", "schema", "table", "backup_hold_sec"},
     "clock-skew": {"offset_sec", "time_sync_service"},
 }
 

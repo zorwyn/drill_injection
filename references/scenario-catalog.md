@@ -106,6 +106,14 @@ Use this catalog to map the user's request to a safe pattern.
 - Verify: dead tuple count via pg_stat_user_tables, autovacuum blocked state, EXPLAIN cost change, SQL p95 latency
 - Rollback: kill the long-holding session, VACUUM the target table, confirm dead tuple count drops and plan cost normalizes
 
+## `barrier-lock`
+
+- Required params: `database`, `schema`, `table`, `backup_hold_sec`
+- Prefer: multi-phase drill — call pg_start_backup() and hold it to simulate stuck backup, inject DDL conflict workers (CHECKPOINT/ALTER TABLE/REINDEX/VACUUM) to trigger BarrierLock contention, run business workload to expose cascading slowdown
+- Guardrails: use dedicated drill table and schema, verify no existing backup before injection, cap backup hold time, abort on replication lag or connection exhaustion
+- Verify: wait_event shows BarrierLock/BackupLock in pg_stat_activity, pg_is_in_backup() returns true, DDL operations blocked, business SQL latency elevated
+- Rollback: pg_stop_backup() or pg_terminate_backend on the backup session, confirm pg_is_in_backup() returns false, verify blocked sessions drain and latency recovers
+
 ## `clock-skew`
 
 - Required params: `offset_sec`, `duration_min`, `time_sync_service`
