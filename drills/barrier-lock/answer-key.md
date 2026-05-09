@@ -17,32 +17,37 @@ pg_start_backup() 调用后未完成 (模拟备份进程卡死)
 与死元组不同, barrier lock 导致的慢有明显特征:
 - **间歇性** — 不是所有查询都慢, 是偶尔卡住几秒
 - **DDL 卡死** — CHECKPOINT / ALTER TABLE 等操作 hang 住
-- **wait_event** — pg_stat_activity 中能看到 BarrierLock 或 BackupLock
+- **等锁会话堆积** — pg_locks 中大量 granted=false 的会话, 等的是 BackupLock 类锁
 
 ## SRE 应该怎么定位
 
-### 第一步: 看活跃会话和等待事件
+### 第一步: 看活跃会话和等锁情况
+
+> 注意: GaussDB 的 pg_stat_activity **没有 wait_event 列** (这是 PostgreSQL 的字段),
+> 应该用 pg_locks 配合 pg_stat_activity 来找等锁会话。
 
 ```sql
--- 这是关键命令 — 看谁在等什么锁
+-- GaussDB 兼容写法: 通过 pg_locks granted=false 找等锁会话
 SELECT
-    pid,
-    state,
-    wait_event_type,
-    wait_event,
-    now() - query_start AS wait_duration,
-    application_name,
-    left(query, 80) AS query
-FROM pg_stat_activity
-WHERE wait_event IS NOT NULL
-  AND state = 'active'
-ORDER BY query_start;
+    a.pid,
+    a.state,
+    l.locktype,
+    l.mode,
+    now() - a.query_start AS wait_duration,
+    a.application_name,
+    left(a.query, 80) AS query
+FROM pg_stat_activity a
+JOIN pg_locks l ON l.pid = a.pid
+WHERE l.granted = false
+  AND a.pid <> pg_backend_pid()
+ORDER BY a.query_start;
 ```
 
 SRE 应该看到:
-- 多个会话 wait_event 显示 `BarrierLock` 或 `BackupLock`
+- 多个会话 granted=false (在等锁)
 - 这些会话的 query 是 CHECKPOINT / DDL 类操作
 - 它们的 wait_duration 持续增长
+- locktype 中有 `relation` 锁堆积, 多源自一个 backup 会话持有的全局锁
 
 ### 第二步: 检查备份状态
 

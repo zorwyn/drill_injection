@@ -481,15 +481,16 @@ phase_verify() {
   info "── 备份状态 ──"
   sql_verbose "SELECT pg_is_in_backup() AS in_backup"
 
-  # 被阻塞的会话
+  # 被阻塞的会话 (GaussDB: 用 pg_locks granted=false 找等锁会话, 不依赖 wait_event 列)
   info "── 等锁会话 ──"
-  sql_verbose "SELECT pid, state, wait_event_type, wait_event,
-      now() - query_start AS wait_duration,
-      application_name, left(query, 60) AS query
-    FROM pg_stat_activity
-    WHERE wait_event IS NOT NULL
-      AND pid <> pg_backend_pid()
-    ORDER BY query_start"
+  sql_verbose "SELECT a.pid, a.state, l.locktype, l.mode,
+      now() - a.query_start AS wait_duration,
+      a.application_name, left(a.query, 60) AS query
+    FROM pg_stat_activity a
+    JOIN pg_locks l ON l.pid = a.pid
+    WHERE l.granted = false
+      AND a.pid <> pg_backend_pid()
+    ORDER BY a.query_start"
 
   # 查询耗时对比
   info ""
@@ -596,20 +597,22 @@ phase_observe() {
         elapsed_min=$(( (now_epoch - start_epoch) / 60 ))
 
         # 采一条业务查询耗时
-        local probe_ms
+        local probe_ms=0
         probe_ms=$(bench_ms "$(get_query 2)")
+        # 防御: 非数字时归零 (避免后续整数比较报错)
+        [[ "${probe_ms}" =~ ^[0-9]+$ ]] || probe_ms=0
 
-        # 统计等锁会话数
-        local waiting_count
-        waiting_count=$(sql "SELECT count(*) FROM pg_stat_activity
-                             WHERE wait_event IS NOT NULL
-                               AND state = 'active'
-                               AND pid <> pg_backend_pid()")
+        # 统计等锁会话数 (GaussDB 兼容: 用 pg_locks granted=false)
+        local waiting_count=0
+        waiting_count=$(sql "SELECT count(DISTINCT pid) FROM pg_locks
+                             WHERE granted = false
+                               AND pid <> pg_backend_pid()" 2>/dev/null | tr -d ' ')
+        [[ "${waiting_count}" =~ ^[0-9]+$ ]] || waiting_count=0
 
         info "── 告警 #${tick}  已持续 ${elapsed_min} 分钟 ──"
         info "业务查询响应: ${probe_ms} ms | 等待中会话: ${waiting_count}"
 
-        if [[ ${probe_ms} -ge 1000 ]] || [[ "${waiting_count}" -ge 3 ]]; then
+        if [[ ${probe_ms} -ge 1000 ]] || [[ ${waiting_count} -ge 3 ]]; then
           info "告警级别: P1 - 严重"
         elif [[ ${probe_ms} -ge 200 ]]; then
           info "告警级别: P2 - 警告"
