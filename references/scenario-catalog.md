@@ -114,6 +114,14 @@ Use this catalog to map the user's request to a safe pattern.
 - Verify: wait_event shows BarrierLock/BackupLock in pg_stat_activity, pg_is_in_backup() returns true, DDL operations blocked, business SQL latency elevated
 - Rollback: pg_stop_backup() or pg_terminate_backend on the backup session, confirm pg_is_in_backup() returns false, verify blocked sessions drain and latency recovers
 
+## `data-skew`
+
+- Required params: `database`, `schema`, `table`, `seed_rows`, `skew_pct`
+- Prefer: dual-table approach — create one table with poor distribution key (low-cardinality column like status) holding skewed data, plus a balanced control table with high-cardinality key (id), run the same OLAP queries on both for direct comparison
+- Guardrails: requires distributed deployment with multiple DNs (script aborts on centralized), use dedicated drill schema, cap seed rows, abort on connection saturation, statement_timeout to prevent runaway queries
+- Verify: pgxc_get_table_skewness() shows one DN holding 90%+ rows, EXPLAIN PERFORMANCE shows asymmetric DN execution time, aggregation/JOIN latency multiples vs balanced table
+- Rollback: drop the schema (data skew is not auto-recoverable — fix is to rebuild table with proper DISTRIBUTE BY clause); drill ends when SRE creates a `<table>_fixed` marker table with balanced distribution
+
 ## `clock-skew`
 
 - Required params: `offset_sec`, `duration_min`, `time_sync_service`
